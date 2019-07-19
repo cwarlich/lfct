@@ -1,0 +1,164 @@
+#!/bin/bash -e
+
+# This script uses the GNU Debugger (gdb) to print a life function call tree
+# of an arbitrary application, including the appropriate function parameter
+# values. Just call it without any parameters to obtain comprehensive usage
+# information.
+
+# Color the function call tree (and the usage information) only if it is printed
+# to a tty or if coloring is explicitly requested.
+if [[ $color == true ]] || [[ -t 1 && $color != false ]]; then
+	begin='\033[32m'
+	end='\033[0m'
+else
+	begin=''
+	end=''
+fi
+
+# Reset terminal colors to a sane value regardless on how the script terminates.
+trap 'echo -e "$end"' EXIT
+
+# Print comprehensive usage information and terminate if this script is executed
+# without any parameters.
+if [[ $# == 0 ]]; then
+	echo -en "$begin"
+	cat <<-EOF
+
+		usage: $0 PROG [ARGS ...]
+		
+		Runs the executable PROG with the parameters ARGS ... and prints
+		a life function call tree of that run, including the appropriate
+		function parameter values. PROG must have been compiled with the
+		compiler switches -g and -finstrument-functions. Furthermore,
+		you may consider to switch off optimization by setting the
+		compiler switch -O0.
+
+		Thus, for a typical automake project, you may want to recompile
+		it with "configure CFLAGS='-g -finstrument-functions -O0"; make;
+		sudo make install".
+		
+		If stdout is connected to a tty or if the environment variable
+		"color" is exported and set to "true", the function call tree is
+		printed in green to distinghuish it from stdout and stderr
+		comming from PROG. If "color" is set to "false", coloring is
+		unconditionally switched off."
+	EOF
+	echo -en "$end"
+	exit 1	
+fi
+
+# Create a shared library that contains empty profiling functions. They are only
+# required by gdb to set breakpoints.
+gcc -xc -o /tmp/profile.so -shared - <<-EOF
+	void __cyg_profile_func_enter(void* a, void* s) {}
+	void __cyg_profile_func_exit(void* a, void* s) {}
+EOF
+# Ensure that PROG finds the profiling functions.
+export LD_PRELOAD="/tmp/profile.so"
+
+# We need the full path of PROG so that gdb can load PROG's symbols.
+# Any remaining parameters (shift!) are later be passed to gdb's "run"
+# command; see below.
+PROG="$(which "$1")"; shift
+
+# Filters gdb's output to transform it into a nicely looking function call tree.
+# Recommandation: Read the gdb here-doc below first and then come back here to
+# understand this function.
+filter() {
+	# Pass begin and end environment variables to the awk script below to
+	# control the coloring of the output.
+	awk -v begin="$begin" -v end="$end" '
+	# Skip the first 4 lines, they are undesired status information from gdb.
+	BEGIN {skip = 4}
+	{
+		# Process the lines that gdb prepended with either { or }, i.e.
+		# the first line of each "up" command that is executed whenever
+		# one of the two breakpoints are hit.
+		if($1 == "{" || $1 == "}") {
+			# The "up" command always prints two lines, but we are
+			# only interested in the first. Thus, we skip the
+			# second line.
+			skip = 1
+			# Decrease the indent by one tab if the breakpoint on
+			# __cyg_profile_func_exit was hit.
+			if($1 == "}") begin = substr(begin, 1, length(begin) - 1)
+			# Print indent and start coloring if it is enabled.
+			printf "%s", begin
+			# We do some additional formatting of the first line of
+			# the "up" command.
+			for(i = 1; i <= NF; i++) {
+				# We do not want to print
+				# - the 2nd field as it only contains the stack
+				#   frame number
+				# - the 3rd field as it only contains the
+				#   function address
+				# - the 4th field as it only contains the word
+				#   "in"
+				if(i < 2 || i > 4) {
+					format = "%s"
+					# We do not want a space between the
+					# function name and its parameter list
+					# and (paranoia) at the very end.
+					if(i != 5 && i != NF) format = format " "
+					# Print the current field (without a
+					# newline and possibly with a trailing
+					# space.
+					printf format, $i
+				}
+			}
+			# Stop coloring if it was enabled and begin a new line.
+			printf "%s\n", end
+			# Increase the indent by one tab if the breakpoint on
+			# __cyg_profile_func_eenter was hit.
+			if($1 == "{") begin = begin "\t" 
+		# Process any other lines.
+		} else {
+			# Skip lines that were marked to be skipped and print
+			# anything else (i.e. the stdout of PROG) unchanged.
+			if(skip == 0) print $0
+			# Account for the fact that one line was skipped.
+			else skip--
+		}
+	}'
+}
+
+# This is the core of the script: It runs PROG (with its ARGS) under the control
+# of gdb. Note that the commands executed by gdb are read from the here-doc that
+# follows and that the stdout from gdb (and PROG) is processed by the filter
+# function defined above.
+gdb -q "$PROG" <<-EOF | filter
+	# We want to pause whenever we enter or exit a function in PROG.
+	break __cyg_profile_func_enter
+	break __cyg_profile_func_exit
+	# We do not want gdb to wrap any of its output.
+	set width unlimited
+	# As breakpoint 1 is set on __cyg_profile_func_enter, the commands
+	# enclosed by "command 1 ... end" are executed whenever we enter a
+	# function.
+	commands 1
+		# Do not output any message when hitting a breakpoint.
+		silent
+		# Prepend with an opening curly brace for function entry (or a
+		# closing curly brace  for function exit, see below).
+		!echo -n "{ "
+		# Print the function name and its parameter values that called
+		# __cyg_profile_func_enter (or __cyg_profile_func_exit).
+		up
+		# Continue PROG.
+		continue
+	end
+	# As breakpoint 2 is set on __cyg_profile_func_eexit, the commands
+	# enclosed by "command 2 ... end" are executed whenever we exit a
+	# function.
+	commands 2
+                # See the comments within "command 1".
+		silent
+		!echo -n "} "
+		up
+		continue
+	end
+	# Finally, we run PROG, passing it its patameters ...
+	run "$@"
+	# ... and quit gdb when done.
+	quit
+EOF
