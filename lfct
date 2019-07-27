@@ -121,7 +121,6 @@ filter() {
 		}
 	}'
 }
-
 # This is the core of the script: It runs PROG (with its ARGS) under the control
 # of gdb. Note that the commands executed by gdb are read from the here-doc that
 # follows and that the stdout from gdb (and PROG) is processed by the filter
@@ -158,7 +157,7 @@ gdb -q "$PROG" <<-EOF | filter
 		continue
 	end
 	# Finally, we run PROG, passing it its patameters ...
-	run "$@"
+	run $@
 	# ... and quit gdb when done.
 	quit
 EOF
